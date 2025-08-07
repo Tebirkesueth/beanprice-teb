@@ -3,6 +3,7 @@
 *.pyc
 *~
 .cache
+.vscode
 .idea
 .noseids
 .pytest_cache
@@ -12,3 +13,5 @@ build
 dist
 beanprice.egg-info
 __pycache__
+developing.py
+prices.beancount

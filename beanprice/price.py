@@ -4,6 +4,7 @@ __copyright__ = "Copyright (C) 2015-2020  Martin Blais"
 __license__ = "GNU GPLv2"
 
 import argparse
+import inspect
 import collections
 import datetime
 import functools
@@ -74,7 +75,7 @@ UNKNOWN_CURRENCY = "?"
 _CACHE = None
 
 # Expiration for latest prices in the cache.
-DEFAULT_EXPIRATION = datetime.timedelta(seconds=30 * 60)  # 30 mins.
+DEFAULT_EXPIRATION = datetime.timedelta(seconds=60 * 60)  # 30 mins.
 
 
 # The default source parser is back.
@@ -481,6 +482,20 @@ def fetch_cached_price(source, symbol, date):
     Returns:
       A SourcePrice instance.
     """
+    
+    # Check if source support large series pulls at once - note that source inherits from Source class which has
+    # a parent implementation, thus we need to ensure the child has a specific method implemented. 
+    gps = (inspect.ismethod(source.get_prices_series) and 'get_prices_series' in vars(source.__class__))
+    if gps:
+        # generate arbitrary start fetch time. 
+        start_string = "2000-01-01T00:00:00"
+        start_time_naive = datetime.datetime.fromisoformat(start_string)
+        start_time = start_time_naive.replace(tzinfo=datetime.timezone.utc)
+        
+        # generate latest end fetch time (now). 
+        end_time_naive = datetime.datetime.now()
+        end_time = end_time_naive.replace(tzinfo=datetime.timezone.utc)
+    
     # Compute a suitable timestamp from the date, if specified.
     if date is not None:
         # We query as for 4pm for the given date of the current timezone, if
@@ -490,14 +505,20 @@ def fetch_cached_price(source, symbol, date):
         time = time_local.astimezone(tz.tzutc())
     else:
         time = None
+    
+    result = None
 
     if _CACHE is None:
         # The cache is disabled; just call and return.
-        result = (
-            source.get_latest_price(symbol)
-            if time is None
-            else source.get_historical_price(symbol, time)
-        )
+        if gps:
+            logging.info("Fetching: %s between start: %s and end: %s", symbol, start_time.date(), end_time.date())
+            result = source.get_prices_series(symbol, start_time, end_time)
+        elif time is None:
+            logging.info("Fetching: %s at latest quote", symbol)
+            result = source.get_latest_price(symbol)
+        else:
+            logging.info("Fetching: %s at time: %s", symbol, time)
+            result = source.get_historical_price(symbol, time)
 
     else:
         # The cache is enabled and we have to compute the current/latest price.
@@ -508,6 +529,11 @@ def fetch_cached_price(source, symbol, date):
         timestamp_now = int(now().timestamp())
         try:
             timestamp_created, result_naive = _CACHE[key]
+            
+            if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
+                raise KeyError
+            
+            print(f"{symbol} cache found for {date}.")
 
             # Convert naive timezone to UTC, which is what the cache is always
             # assumed to store. (The reason for this is that timezones from
@@ -517,33 +543,135 @@ def fetch_cached_price(source, symbol, date):
                     time=result_naive.time.replace(tzinfo=tz.tzutc())
                 )
             else:
-                result = result_naive
-
-            if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
-                raise KeyError
+                result = result_naive       
+            
         except KeyError:
-            logging.info("Fetching: %s (time: %s)", symbol, time)
-            try:
-                result = (
-                    source.get_latest_price(symbol)
-                    if time is None
-                    else source.get_historical_price(symbol, time)
-                )
-            except ValueError as exc:
-                logging.error("Error fetching %s: %s", symbol, exc)
-                result = None
+            
+            # If gps is true for this source and a previous call successfully executed the CACHE should already contain all available data.
+            # If the exact date match is not found it is likely because that days was not a trading day. Before pulling the full history again.
+            # double check whether a date close to the requested date is availabe in the CACHE.
+            if gps:
+                # Define the search range: +/- 3 days from the requested date.
+                date_search_range = range(-3, 4)
+                best_match_key = None
+                min_delta = datetime.timedelta(days=999999) 
+                
+                for day_offset in date_search_range:
+                    search_date = date + datetime.timedelta(days=day_offset)
+                    
+                    # Generate a new key for the date being checked
+                    md5 = hashlib.md5()
+                    md5.update(str((type(source).__module__, symbol, search_date)).encode("utf-8"))
+                    search_key = md5.hexdigest()
+                    
+                    try:
+                        timestamp_created, result_naive = _CACHE[search_key]
+                        
+                        # Check for expiration
+                        if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
+                            # Expired data found; continue the search for an unexpired entry.
+                            continue
+                        
+                        # Calculate the time delta between the requested date and this match
+                        current_delta = abs(date - search_date)
+                        
+                        # If this is a better match, store its key and delta
+                        if current_delta < min_delta:
+                            min_delta = current_delta
+                            best_match_key = search_key
+                            date_found_in_cache = True
+                        
+                    except KeyError:
+                        # No cache entry for this date; continue to the next date in the loop.
+                        continue
+                
+                # After the loop, check if a best match was found
+                if best_match_key:
+                    print(f"{symbol} cache miss for {date}, but found closest match with a delta of {min_delta.days} day(s).")
+                    
+                    # Retrieve the best match from the cache using its key
+                    _, result_naive = _CACHE[best_match_key]
+                    
+                    # Convert timezone and set result as before
+                    if result_naive.time is not None:
+                        result = result_naive._replace(time=result_naive.time.replace(tzinfo=tz.tzutc()))
+                    else:
+                        result = result_naive
+                
+                else:
+                    result = None
+            
+            if result is None:      
+                try:
+                    if gps:
+                        logging.info("Fetching: %s between start: %s and end: %s", symbol, start_time.date(), end_time.date())
+                        result = source.get_prices_series(symbol, start_time, end_time)
+                    elif time is None:
+                        logging.info("Fetching: %s at latest quote", symbol)
+                        result = source.get_latest_price(symbol)
+                    else:
+                        logging.info("Fetching: %s at time: %s", symbol, time)
+                        result = source.get_historical_price(symbol, time)
+                except ValueError as exc:
+                    logging.error("Error fetching %s: %s", symbol, exc)
+                    result = None
 
-            # Make sure the timezone is UTC and make naive before serialization.
-            if result and result.time is not None:
-                time_utc = result.time.astimezone(tz.tzutc())
-                time_naive = time_utc.replace(tzinfo=None)
-                result_naive = result._replace(time=time_naive)
-            else:
-                result_naive = result
+                # Make sure the timezone is UTC and make naive before serialization.
+                # Check if result is a list of SourcePrice (get_prices_series active).
+                if isinstance(result, list):
+                    result_list = result # result will be overwritten once date is found in the returned list[SourcePrice]
 
-            if result_naive is not None:
-                _CACHE[key] = (timestamp_now, result_naive)
-    return result
+                    best_match_res = None # simultaneously check for the res that best matches the requested date. 
+                    min_delta_res = datetime.timedelta(days=999999)
+                    
+                    for res in result_list:
+                        if res and res.time is not None:
+                            time_utc = res.time.astimezone(tz.tzutc())
+                            time_naive = time_utc.replace(tzinfo=None)
+                            res_naive = res._replace(time=time_naive)
+                        else:
+                            res_naive = res
+
+                        if res_naive is not None:
+                            md5 = hashlib.md5()
+                            md5.update(str((type(source).__module__, symbol, res_naive.time.date())).encode("utf-8"))
+                            key = md5.hexdigest()
+                            _CACHE[key] = (timestamp_now, res_naive)
+                            
+                            current_delta = abs(date - res.time.date())
+                            if current_delta < min_delta_res:
+                                min_delta_res = current_delta
+                            
+                            if current_delta < datetime.timedelta(days=3):
+                                best_match_res = res
+                    
+                    # store and return the best matching result, or None.
+                    if best_match_res is not None: 
+                        result = best_match_res
+                    else:
+                        result = None            
+                        
+                else:      
+                    if result and result.time is not None:
+                        time_utc = result.time.astimezone(tz.tzutc())
+                        time_naive = time_utc.replace(tzinfo=None)
+                        result_naive = result._replace(time=time_naive)
+                    else:
+                        result_naive = result
+
+                    if result_naive is not None:
+                        md5 = hashlib.md5()
+                        # note that we're using date instead of result_naive.time.date() - this is because many price fetching
+                        # functions will search the requested date +- a few days. This way the stored date will correspond to the 
+                        # fetched value. 
+                        md5.update(str((type(source).__module__, symbol, date)).encode("utf-8"))
+                        key = md5.hexdigest()
+                        _CACHE[key] = (timestamp_now, result_naive)
+    
+    if isinstance(result, list):
+        raise TypeError(rf"A quote date could not be found matching {date} - dates of {symbol} correct?")
+    else:
+        return result
 
 
 def setup_cache(cache_filename: Optional[str], clear_cache: bool):
@@ -721,6 +849,13 @@ def process_args() -> Tuple[
         action="store",
         type=date_utils.parse_date_liberally,
         help=("Specify the date for which to fetch the prices."),
+    )
+    
+    parser.add_argument(
+        "--gps",
+        nargs="+",
+        type=str,
+        help=("Specify sources supporting get_prices_series."),
     )
 
     parser.add_argument(
@@ -952,7 +1087,8 @@ def main():
         for dprice in jobs:
             print(format_dated_price_str(dprice))
         return
-
+    
+    """
     # Fetch all the required prices, processing all the jobs.
     executor = futures.ThreadPoolExecutor(max_workers=args.workers)
     price_entries = filter(
@@ -961,6 +1097,14 @@ def main():
             functools.partial(fetch_price, swap_inverted=args.swap_inverted), jobs
         ),
     )
+    """
+
+    # --- SQLite cache thread safe (no thread) - to solve needs to use other package than shelve ---
+    price_entries = []
+    for job in jobs:
+        price = fetch_price(job, swap_inverted=args.swap_inverted)
+        if price is not None:
+            price_entries.append(price)
 
     # Sort them by currency, regardless of date (the dates should be close
     # anyhow, and we tend to put them in chunks in the input files anyhow).

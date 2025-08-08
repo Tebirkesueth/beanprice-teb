@@ -533,7 +533,7 @@ def fetch_cached_price(source, symbol, date):
             if (timestamp_now - timestamp_created) > _CACHE.expiration.total_seconds():
                 raise KeyError
             
-            print(f"{symbol} cache found for {date}.")
+            logging.info(f"{symbol} cache found for {date}.")
 
             # Convert naive timezone to UTC, which is what the cache is always
             # assumed to store. (The reason for this is that timezones from
@@ -587,7 +587,7 @@ def fetch_cached_price(source, symbol, date):
                 
                 # After the loop, check if a best match was found
                 if best_match_key:
-                    print(f"{symbol} cache miss for {date}, but found closest match with a delta of {min_delta.days} day(s).")
+                    logging.info(f"{symbol} cache miss for {date}, but found closest match with a delta of {min_delta.days} day(s).")
                     
                     # Retrieve the best match from the cache using its key
                     _, result_naive = _CACHE[best_match_key]

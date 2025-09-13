@@ -892,7 +892,13 @@ def process_args() -> Tuple[
     
     parser.add_argument(
         "--destination",
-        help="Specify the output filename (e.g., --output my_prices.txt)"
+        help="Specify the output filename (e.g., --output my_prices.txt). Note default overwrite if existing - set --append if needed."
+    )
+    
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append new entries to the destination file instead of overwriting it."
     )
 
     parser.add_argument(
@@ -1124,17 +1130,6 @@ def main():
         for dprice in jobs:
             print(format_dated_price_str(dprice))
         return
-    
-    """
-    # Fetch all the required prices, processing all the jobs.
-    executor = futures.ThreadPoolExecutor(max_workers=args.workers)
-    price_entries = filter(
-        None,
-        executor.map(
-            functools.partial(fetch_price, swap_inverted=args.swap_inverted), jobs
-        ),
-    )
-    """
 
     # --- SQLite cache thread safe (no thread) - to solve needs to use other package than shelve ---
     price_entries = []
@@ -1159,8 +1154,11 @@ def main():
 
     # Print out the entries.
     if args.destination:
+        how = 'w'
+        if args.append:
+            how = 'a'
         print(f"Writing entries to file: {args.destination}")
-        with open(args.destination, 'w') as f:
+        with open(args.destination, how) as f:
             printer.print_entries(price_entries, dcontext=dcontext, file=f)
         print(f"Entries have been saved to {args.destination}")
     else:

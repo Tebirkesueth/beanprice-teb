@@ -551,6 +551,26 @@ def fetch_cached_price(source, symbol, date):
             # If the exact date match is not found it is likely because that days was not a trading day. Before pulling the full history again.
             # double check whether a date close to the requested date is availabe in the CACHE.
             if gps:
+                # In some instances a symbol might be delisted due to a merger or other reason. This means that price data is missing
+                # for some dates between an historical date and today. The code will check if the data returned from the API is complete, 
+                # i.e. has price data up to the latest date or it cut off. 
+                
+                # Generate a new key for the date being checked
+                md5 = hashlib.md5()
+                md5.update(str((type(source).__module__, symbol, "delisted")).encode("utf-8"))
+                search_key = md5.hexdigest()
+                delisted = None
+                try:
+                    delisted_date = _CACHE[search_key]
+                    delisted = date > delisted_date
+                except:
+                    pass
+                
+                if delisted:
+                    # The symbol is considered delisted - don't call the API. 
+                    logging.info("Symbol: %s has no price at date: %s as last price info is on: %s.", symbol, date, delisted_date)
+                    return None
+                
                 # Define the search range: +/- 3 days from the requested date.
                 date_search_range = range(-3, 4)
                 best_match_key = None
@@ -601,7 +621,7 @@ def fetch_cached_price(source, symbol, date):
                 else:
                     result = None
             
-            if result is None:      
+            if result is None:
                 try:
                     if gps:
                         logging.info("Fetching: %s between start: %s and end: %s", symbol, start_time.date(), end_time.date())
@@ -649,8 +669,20 @@ def fetch_cached_price(source, symbol, date):
                     if best_match_res is not None: 
                         result = best_match_res
                     else:
-                        result = None            
-                        
+                        result = None
+                    
+                    # Once the full result_list has been stored in cache, check if the latest date is historical to such a 
+                    # degree that it indicates the symbol has been delisted or merged into another company.
+                    latest_date = result_list[-1].time.date()
+                    cross_check_date = (datetime.datetime.now() - datetime.timedelta(days=7)).date() # some margin due to weekends and long holidays. 
+                    if latest_date < cross_check_date:
+                        # The symbol doesn't have recent data -> likely delisted. 
+                        logging.info("Symbol: %s has last price at date: %s which indicates it is delisted.", symbol, latest_date)
+                        md5 = hashlib.md5()
+                        md5.update(str((type(source).__module__, symbol, "delisted")).encode("utf-8"))
+                        key = md5.hexdigest()
+                        _CACHE[key] = (latest_date)
+                    
                 else:      
                     if result and result.time is not None:
                         time_utc = result.time.astimezone(tz.tzutc())
@@ -856,6 +888,11 @@ def process_args() -> Tuple[
         nargs="+",
         type=str,
         help=("Specify sources supporting get_prices_series."),
+    )
+    
+    parser.add_argument(
+        "--destination",
+        help="Specify the output filename (e.g., --output my_prices.txt)"
     )
 
     parser.add_argument(
@@ -1121,7 +1158,13 @@ def main():
             logging.info("Ignored to avoid clobber: %s %s", entry.date, entry.currency)
 
     # Print out the entries.
-    printer.print_entries(price_entries, dcontext=dcontext)
+    if args.destination:
+        print(f"Writing entries to file: {args.destination}")
+        with open(args.destination, 'w') as f:
+            printer.print_entries(price_entries, dcontext=dcontext, file=f)
+        print(f"Entries have been saved to {args.destination}")
+    else:
+        printer.print_entries(price_entries, dcontext=dcontext)
 
 if __name__ == '__main__':
     main()
